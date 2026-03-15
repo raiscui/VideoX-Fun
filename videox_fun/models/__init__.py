@@ -1,4 +1,5 @@
 import importlib.util
+import warnings
 
 from diffusers import AutoencoderKL
 from transformers import (AutoProcessor, AutoTokenizer, CLIPImageProcessor,
@@ -21,7 +22,6 @@ except Exception:
 
 from .cogvideox_transformer3d import CogVideoXTransformer3DModel
 from .cogvideox_vae import AutoencoderKLCogVideoX
-from .fantasytalking_audio_encoder import FantasyTalkingAudioEncoder
 from .fantasytalking_transformer3d import FantasyTalkingTransformer3DModel
 from .flux2_image_processor import Flux2ImageProcessor
 from .flux2_transformer2d import Flux2Transformer2DModel
@@ -40,7 +40,6 @@ from .qwenimage_transformer2d_control import QwenImageControlTransformer2DModel
 from .qwenimage_transformer2d_instantx import QwenImageInstantXControlNetModel
 from .qwenimage_vae import AutoencoderKLQwenImage
 from .turbowan_transformer3d import TurboWanTransformer3DModel
-from .wan_audio_encoder import WanAudioEncoder
 from .wan_image_encoder import CLIPModel
 from .wan_text_encoder import WanT5EncoderModel
 from .wan_transformer3d import (Wan2_2Transformer3DModel, WanRMSNorm,
@@ -52,6 +51,59 @@ from .wan_vae import AutoencoderKLWan, AutoencoderKLWan_
 from .wan_vae3_8 import AutoencoderKLWan2_2_, AutoencoderKLWan3_8
 from .z_image_transformer2d import ZImageTransformer2DModel
 from .z_image_transformer2d_control import ZImageControlTransformer2DModel
+
+
+def _build_missing_optional_dependency_class(class_name, dependency_name, import_error):
+    """为可选依赖缺失场景生成占位类.
+
+    VerseCrafter 当前主工作流不会用到音频编码器.
+    但 `videox_fun.models` 以前会在包初始化阶段强制导入音频模块,
+    让无音频推理也被 `librosa` 卡死.
+    """
+
+    class _MissingOptionalDependency:
+        def __init__(self, *args, **kwargs):
+            raise ModuleNotFoundError(
+                f"{class_name} requires optional dependency '{dependency_name}'. "
+                f"Please install third_party/VideoX-Fun/requirements.txt or add '{dependency_name}' explicitly."
+            ) from import_error
+
+    _MissingOptionalDependency.__name__ = class_name
+    return _MissingOptionalDependency
+
+
+try:
+    from .fantasytalking_audio_encoder import FantasyTalkingAudioEncoder
+except ModuleNotFoundError as import_error:
+    if import_error.name != "librosa":
+        raise
+    warnings.warn(
+        "FantasyTalkingAudioEncoder is unavailable because optional dependency 'librosa' is missing. "
+        "This does not affect VerseCrafter's non-audio workflows.",
+        RuntimeWarning,
+    )
+    FantasyTalkingAudioEncoder = _build_missing_optional_dependency_class(
+        "FantasyTalkingAudioEncoder",
+        "librosa",
+        import_error,
+    )
+
+
+try:
+    from .wan_audio_encoder import WanAudioEncoder
+except ModuleNotFoundError as import_error:
+    if import_error.name != "librosa":
+        raise
+    warnings.warn(
+        "WanAudioEncoder is unavailable because optional dependency 'librosa' is missing. "
+        "This does not affect VerseCrafter's non-audio workflows.",
+        RuntimeWarning,
+    )
+    WanAudioEncoder = _build_missing_optional_dependency_class(
+        "WanAudioEncoder",
+        "librosa",
+        import_error,
+    )
 
 # The pai_fuser is an internally developed acceleration package, which can be used on PAI.
 if importlib.util.find_spec("paifuser") is not None:
