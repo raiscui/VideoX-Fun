@@ -1,4 +1,5 @@
 import importlib.util
+import os
 
 import torch
 import torch.distributed as dist
@@ -33,12 +34,69 @@ except Exception as ex:
     init_distributed_environment = None
     initialize_model_parallel = None
 
+
+def _get_local_rank() -> int:
+    """读取 torchrun 注入的 LOCAL_RANK."""
+
+    return int(os.environ.get("LOCAL_RANK", "0"))
+
+
+def _get_local_world_size(default_world_size: int) -> int:
+    """读取当前节点的本地 worker 数.
+
+    优先使用 torchrun 注入的 `LOCAL_WORLD_SIZE`.
+    如果环境变量缺失, 再退回调用方期望的 worker 数.
+    """
+
+    local_world_size = os.environ.get("LOCAL_WORLD_SIZE")
+    if local_world_size is None:
+        return default_world_size
+    return int(local_world_size)
+
+
+def _validate_local_cuda_topology(expected_local_workers: int) -> int:
+    """在真正初始化 FSDP / NCCL 前, 先确认本地 rank 可映射到真实 GPU.
+
+    这样能把 `invalid device ordinal` 这种深层 CUDA 异常,
+    提前收敛成更容易读懂的配置错误.
+    """
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "Distributed CUDA preflight failed: torch.cuda.is_available() is False, "
+            "but multi-GPU inference was requested."
+        )
+
+    local_rank = _get_local_rank()
+    visible_device_count = torch.cuda.device_count()
+    if visible_device_count < expected_local_workers:
+        raise RuntimeError(
+            "Distributed CUDA preflight failed: "
+            f"torchrun requested {expected_local_workers} local workers, "
+            f"but this process only sees {visible_device_count} CUDA device(s). "
+            f"LOCAL_RANK={local_rank}, CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}. "
+            "Please reduce --nproc-per-node / ulysses_degree / ring_degree, "
+            "or expose more local GPUs before retrying."
+        )
+    if local_rank >= visible_device_count:
+        raise RuntimeError(
+            "Distributed CUDA preflight failed: "
+            f"LOCAL_RANK={local_rank} is out of range for {visible_device_count} visible CUDA device(s). "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}."
+        )
+    return local_rank
+
 def set_multi_gpus_devices(ulysses_degree, ring_degree, classifier_free_guidance_degree=1):
     if ulysses_degree > 1 or ring_degree > 1 or classifier_free_guidance_degree > 1:
         if get_sp_group is None:
             raise RuntimeError("xfuser is not installed.")
+        expected_local_workers = _get_local_world_size(
+            ring_degree * ulysses_degree * classifier_free_guidance_degree
+        )
+        local_rank = _validate_local_cuda_topology(expected_local_workers)
+        torch.cuda.set_device(local_rank)
         dist.init_process_group("nccl")
-        print('parallel inference enabled: ulysses_degree=%d ring_degree=%d classifier_free_guidance_degree=% rank=%d world_size=%d' % (
+        print('parallel inference enabled: ulysses_degree=%d ring_degree=%d classifier_free_guidance_degree=%d rank=%d world_size=%d' % (
             ulysses_degree, ring_degree, classifier_free_guidance_degree, dist.get_rank(),
             dist.get_world_size()))
         assert dist.get_world_size() == ring_degree * ulysses_degree * classifier_free_guidance_degree, \
@@ -48,8 +106,9 @@ def set_multi_gpus_devices(ulysses_degree, ring_degree, classifier_free_guidance
                 classifier_free_guidance_degree=classifier_free_guidance_degree,
                 ring_degree=ring_degree,
                 ulysses_degree=ulysses_degree)
-        # device = torch.device("cuda:%d" % dist.get_rank())
-        device = torch.device(f"cuda:{get_world_group().local_rank}")
+        # 这里显式绑定到 LOCAL_RANK 对应的 GPU.
+        # 这样 FSDP / 后续 CUDA 张量分配都会落在当前进程真实可见的本地设备上.
+        device = torch.device(f"cuda:{local_rank}")
         print('rank=%d device=%s' % (get_world_group().rank, str(device)))
     else:
         device = "cuda"
